@@ -120,8 +120,15 @@ def smb_enumeration(ip, user, password, fqdn=None):
         status(False, "NetExec isn't installed (how bro)")
         sys.exit(1)
     print(f"{BLUE} => Enumerating SMB Shares...{RESET}")
-    testing = run(["nc", ip, "-vz", "445"])
-    if "open" not in testing:
+    testing = run(
+        ["nc", "-vz", ip, "445"],
+        capture_output=True,   # captures both stdout and stderr
+        text=True,             # returns strings, not bytes
+        timeout=5
+    )
+
+    out = (testing.stdout or "") + (testing.stderr or "")
+    if "open" not in out.lower():
         status(False, "SMB doesn't seem to be open. Skipping..")
         return None
     if fqdn:
@@ -131,12 +138,13 @@ def smb_enumeration(ip, user, password, fqdn=None):
         out = run(["nxc", "smb", ip, "-u", user, "-p", password, "--shares"], capture_output=True, text=True)
         loggedonout = run(["nxc", "smb", ip, "-u", user, "-p", password, "--loggedon-users"], capture_output=True, text=True)
     print_clean(out.stdout)
-    if "rpc_s_access_denied" in loggedonout:
-        status(False, "Couldn't enum logged-on users using smb")
+    combined_log = (loggedonout.stdout or "") + (loggedonout.stderr or "")
+    if "rpc_s_access_denied" in combined_log.lower():
+        status(False, "\nCouldn't enum logged-on users using smb")
     else:
-        lines = loggedonout.splitlines(keepends=True)
+        lines = combined_log.splitlines(keepends=True)
         result = ''.join(lines[2:])
-        status(True, "Possibly found logged-on users:")
+        status(True, "\nPossibly found logged-on users:")
         print(result)
 
 
