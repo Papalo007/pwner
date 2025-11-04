@@ -2,16 +2,8 @@
 """
 pwner.py - Python rewrite of pwner.sh
 Features:
- - argparse for CLI
- - subprocess calls with safe args
- - optional Kerberos (-k): getTGT via impacket-getTGT, export KRB5CCNAME
- - domain detection from `nxc ldap`
- - BloodHound collection using nxc (with Kerberos)
- - SMB share check (smbmap or smbclient)
- - Certipy run + JSON parsing
- - signal handling + cleanup
+ - a lot
 """
-#TODO: For smb, try all initial netexec vuln modules
 #TODO: Add automatic ESC exploitation 
 #TODO: Add the --start function
 
@@ -124,16 +116,28 @@ def run_bloodhound_nxc(fqdn, user, password, ip, use_kerb):
     return True
 
 def smb_enumeration(ip, user, password, fqdn=None):
-    if which("nxc"):
-        print(f"{BLUE} => Enumerating SMB Shares...{RESET}")
-        if fqdn:
-            out = run(["nxc", "smb", fqdn, "-k", "-u", user, "-p", password, "--shares"], capture_output=True, text=True)
-        else:
-            out = run(["nxc", "smb", ip, "-u", user, "-p", password, "--shares"], capture_output=True, text=True)
-        print_clean(out.stdout)
-    else:
-        status(False, "NetExec isn't intsalled (how bro)")
+    if not which("nxc"):
+        status(False, "NetExec isn't installed (how bro)")
         sys.exit(1)
+    print(f"{BLUE} => Enumerating SMB Shares...{RESET}")
+    testing = run(["nc", ip, "-vz", "445"])
+    if "open" not in testing:
+        status(False, "SMB doesn't seem to be open. Skipping..")
+        return None
+    if fqdn:
+        out = run(["nxc", "smb", fqdn, "-k", "-u", user, "-p", password, "--shares"], capture_output=True, text=True)
+        loggedonout = run(["nxc", "smb", fqdn, "-k", "-u", user, "-p", password, "--loggedon-users"], capture_output=True, text=True)
+    else:
+        out = run(["nxc", "smb", ip, "-u", user, "-p", password, "--shares"], capture_output=True, text=True)
+        loggedonout = run(["nxc", "smb", ip, "-u", user, "-p", password, "--loggedon-users"], capture_output=True, text=True)
+    print_clean(out.stdout)
+    if "rpc_s_access_denied" in loggedonout:
+        status(False, "Couldn't enum logged-on users using smb")
+    else:
+        lines = loggedonout.splitlines(keepends=True)
+        result = ''.join(lines[2:])
+        status(True, "Possibly found logged-on users:")
+        print(result)
 
 
 def print_clean(text):
