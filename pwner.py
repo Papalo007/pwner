@@ -11,13 +11,16 @@ Features:
  - Certipy run + JSON parsing
  - signal handling + cleanup
 """
+#TODO: For smb, try all initial netexec vuln modules
+#TODO: Add automatic ESC exploitation 
+#TODO: Add the --start function
 
-import argparse, os, sys, re, json, tempfile, signal
-from subprocess import run, CalledProcessError, DEVNULL
+import argparse, os, sys, re, json, tempfile, signal, shlex, shutil
+from subprocess import run, CalledProcessError, DEVNULL, CompletedProcess
 from pathlib import Path
 
 # ANSI colors
-RED = '\033[0;31m'; GREEN = '\033[0;32m'; BLUE = '\033[0;34m'; YELLOW = '\033[0;33m'; RESET = '\033[0m'
+RED = '\033[0;31m'; GREEN = '\033[0;32m'; BLUE = '\033[0;34m'; YELLOW = '\033[0;33m'; RESET = '\033[0m'; BOLD = "\033[1m"
 
 def status(ok, msg):
     prefix = f"{GREEN}[+]{RESET}" if ok else f"{RED}[-]{RESET}"
@@ -46,22 +49,8 @@ def which(binname: str) -> bool:
     except (CalledProcessError, FileNotFoundError):
         return False
 
-def detect_domain_from_nxc(ip):
-    if not which("nxc"):
-        return None
-    r = run(["nxc", "ldap", ip], capture_output=True, text=True)
-    txt = (r.stdout or "") + (r.stderr or "")
-    m = re.search(r'domain:([^\)\s]+)', txt)
-    if m:
-        return m.group(1)
-    # fallback to any hostname.domain.tld
-    m2 = re.search(r'([A-Za-z0-9._-]+\.[A-Za-z]{2,})', txt)
-    if m2:
-        return m2.group(1)
-    return "UNKNOWN"
-
 def get_tgt_impacket(domain, user, password, tmpdir):
-    domain_up = domain.split('.', 1)[1].upper()
+    domain_up = domain.upper()
     status(True, f"Attempting impacket-getTGT for {domain_up}")
     outpath = Path(tmpdir) / "impacket_gettgt.out"
     # call impacket-getTGT safely
@@ -81,43 +70,160 @@ def get_tgt_impacket(domain, user, password, tmpdir):
         return candidates[0]
     return None
 
-def run_bloodhound_nxc(domain, user, password, ip, use_kerb, out_file):
-    # domain should be FQDN like dc01.voleur.htb
+def detect_domain_from_nxc(ip):
     if not which("nxc"):
-        status(False, "nxc not installed. Cannot run BloodHound via nxc")
-        return False
-    cmd = ["nxc", "ldap", domain]
+        status(False, "NetExec is not installed bruh I'm terminating ts")
+        sys.exit(1)
+    r = run(["nxc", "ldap", ip], capture_output=True, text=True)
+    txt = (r.stdout or "") + (r.stderr or "")
+    m = re.search(r'domain:([^\)\s]+)', txt)
+    if m:
+        return m.group(1)
+    # fallback to any hostname.domain.tld
+    m2 = re.search(r'([A-Za-z0-9._-]+\.[A-Za-z]{2,})', txt)
+    if m2:
+        return m2.group(1)
+    return None
+
+def run_bloodhound_nxc(fqdn, user, password, ip, use_kerb):
+    if not which("nxc"):
+        status(False, "NetExec not installed. Cannot run BloodHound via nxc")
+        sys.exit(1)
+    cmd = ["nxc", "ldap", fqdn]
+    domain = fqdn.split(".", 1)[1]
     if use_kerb:
         cmd += ["-k"]
-    else:
-        cmd += ["-u", user, "-p", password]
-    # nxc ldap FQDN -k -u 'USER' -p 'PASS' --dns-server IP -c All --bloodhound
-    # include -u -p even with -k 
-    if use_kerb:
-        cmd += ["-u", user, "-p", password]
-    cmd += ["--dns-server", ip, "-c", "All", "--bloodhound"]
+    cmd += ["-u", user, "-p", password, "-d", domain, "--dns-server", ip, "-c", "All", "--bloodhound"]
     r = run(cmd, capture_output=True, text=True)
     out = (r.stdout or "") + (r.stderr or "")
-    Path(out_file).write_text(out)
-    status(True, f"BloodHound collection saved to {out_file}")
+
+    # Get zip path
+
+    m = re.search(r'(/home/[^/\s]+/\.nxc/logs/[^\s"]+\.zip)', out)
+    if not m:
+        status(False, "Could not find BloodHound zip path in nxc output:")
+        print(out)
+        sys.exit(1)
+
+    src = Path(m.group(1))
+    if not src.exists():
+        status(False, f"Reported zip path does not exist: {src}")
+        sys.exit(1)
+
+    dest = Path(f"./{domain}_{user}_bhcol.zip")
+    # replace existing dest 
+    try:
+        if dest.exists():
+            dest.unlink()
+        shutil.move(str(src), str(dest))
+    except Exception as e:
+        status(False, f"Failed to move zip: {e}")
+        sys.exit(1)
+
+    status(True, f"BloodHound collection saved to {dest}")
     return True
 
-def smb_enumeration(ip, user, password):
-    if which("smbmap"):
-        run_cmd(["smbmap", "-u", user, "-p", password, "-H", ip], "smbmap enumeration")
-    elif which("smbclient"):
-        run_cmd(["smbclient", "-L", f"//{ip}", "-U", f"{user}%{password}"], "smbclient list")
+def smb_enumeration(ip, user, password, fqdn=None):
+    if which("nxc"):
+        print(f"{BLUE} => Enumerating SMB Shares...{RESET}")
+        if fqdn:
+            out = run(["nxc", "smb", fqdn, "-k", "-u", user, "-p", password, "--shares"], capture_output=True, text=True)
+        else:
+            out = run(["nxc", "smb", ip, "-u", user, "-p", password, "--shares"], capture_output=True, text=True)
+        print_clean(out.stdout)
     else:
-        status(False, "No SMB enumeration tool (smbmap/smbclient) available")
+        status(False, "NetExec isn't intsalled (how bro)")
+        sys.exit(1)
+
+
+def print_clean(text):
+    # accept CompletedProcess or string
+    if isinstance(text, CompletedProcess):
+        text = text.stdout or ""
+    elif text is None:
+        text = ""
+    elif not isinstance(text, str):
+        text = str(text)
+
+    # Remove the "SMB fqdn port role" prefix from each line
+    lines = []
+    for ln in text.splitlines():
+        no_prefix = re.sub(r'^[A-Z]+\s+\S+\s+\d+\s+\S+\s+', '', ln)
+        # skip purely-empty lines
+        if no_prefix.strip():
+            lines.append(no_prefix.rstrip())
+
+    if not lines:
+        return
+
+    # Try to find the header line (contains both 'Share' and 'Permissions')
+    header_idx = None
+    for i, ln in enumerate(lines):
+        if re.search(r'\bShare\b', ln, re.IGNORECASE) and re.search(r'\bPermissions\b', ln, re.IGNORECASE):
+            header_idx = i
+            break
+        # fallback: detect separator like "-----"
+        if re.search(r'^\s*-{3,}\s+', ln):
+            header_idx = max(0, i-1)  # include the line before the separator (likely header) if exists
+            break
+
+    if header_idx is not None:
+        # keep everything from header onward (removes the initial noise)
+        lines = lines[header_idx:]
+    else:
+        # otherwise, filter out explicit noise lines like "[*]" or "[+]"
+        lines = [ln for ln in lines if not re.match(r'^\s*\[[\*\+!]', ln)]
+
+    # Split rows into columns by 2+ spaces (keeps single-space data intact)
+    rows = [re.split(r'\s{2,}', ln.strip()) for ln in lines if ln.strip()]
+
+    if not rows:
+        return
+
+    # Normalize number of columns to 3 (Share, Permissions, Remark)
+    for r in rows:
+        while len(r) < 3:
+            r.append('')
+
+    # Compute column widths (based on content, but don't count ANSI codes)
+    def visible_len(s: str) -> int:
+        return len(re.sub(r'\033\[[0-9;]*m', '', s))
+
+    col_widths = [0, 0, 0]
+    for r in rows:
+        for i in range(3):
+            col_widths[i] = max(col_widths[i], visible_len(r[i]))
+
+    # Print with alignment. Header (first row) printed raw (no coloring).
+    print()  # blank line before table
+    for idx, cols in enumerate(rows):
+        share, perms, remark = cols[0], cols[1], cols[2]
+
+        # If this is the header row (detect "Share" in first column), don't color
+        is_header = bool(re.search(r'\bShare\b', share, re.IGNORECASE) and re.search(r'\bPermissions\b', perms, re.IGNORECASE)) \
+                    or re.match(r'^\s*-{3,}\s*$', share)
+
+        if is_header:
+            share_s = share
+            perms_s = perms
+        else:
+            share_s = f"{BOLD}{share}{RESET}" if share else ''
+            perms_s = f"{YELLOW}{perms}{RESET}" if perms else ''
+
+        # pad considering visible length (so ANSI codes don't break alignment)
+        pad_share = col_widths[0] - visible_len(share)
+        pad_perms = col_widths[1] - visible_len(perms)
+
+        print(f"    {share_s}{' ' * pad_share}   {perms_s}{' ' * pad_perms}   {remark}")
 
 def run_certipy(user, password, ip, domain_upper, tmp_txt):
     if not which("certipy"):
-        status(False, "certipy not installed; skipping cert scan")
-        return None
+        status(False, "bro download certipy wtf")
+        sys.exit(1)
     args = ["certipy", "find", "-vulnerable"]
     # If you want -k with certipy and -target FQDN:
     if os.environ.get("KRB5CCNAME"):
-        args += ["-k", "-u", user, "-p", password, "-target", f"DC01.{domain_upper}"]
+        args += ["-k", "-u", user, "-p", password, "-dc-ip", ip, "-target", f"{domain_upper}"]
     else:
         args += ["-u", user, "-p", password, "-dc-ip", ip]
     r = run(args, capture_output=True, text=True)
@@ -171,45 +277,33 @@ def main():
         signal.signal(signal.SIGTERM, on_sig)
     
         ip = args.ip; user = args.user; password = args.passwd 
-        if args.domain:
-            regexStr = re.compile(r'^[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.[A-Za-z0-9-]+$') # Check if the domain is in the form of *.*.*
-            if not regexStr.match(domain):
-                status(False, f"Invalid domain: {args.domain}\nProvide the FQDN e.g. dc01.voleur.htb") 
-            domain = args.domain
-        else:
-            domain = detect_domain_from_nxc(ip)
-        status(True, f"Pinging {ip} ...")
+        
+            
+        print(f"{BLUE} => Pinging {ip}...{RESET}")
         ping_res = run(["ping","-c","1","-W","2", ip], capture_output=True, text=True)
         if ping_res.returncode != 0:
             status(False, f"Host {ip} unreachable")
             sys.exit(1)
 
-        if (domain):
-            domain_upper = domain.upper()
+        regexStr = re.compile(r'^[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.[A-Za-z0-9-]+$') # Check if the domain is in the form of *.*.*
+        if args.domain and not regexStr.match(args.domain):
+            status(False, f"Invalid domain: {args.domain}\nProvide the FQDN e.g. dc01.voleur.htb") 
+        elif args.domain:
+            fqdn = args.domain
+            domain = fqdn.split(".", 1)[1]
         else:
-            status(False, f"Couldn't find domain, consider specifying it with -d FQDN")
-            sys.exit(1)
-        status(True, f"Using domain: {domain}")
+            domain = detect_domain_from_nxc(ip)
+            cmd = f"dig +short ANY @{shlex.quote(ip)} {shlex.quote(domain)} | grep {shlex.quote(domain)} | head -n1 | sed 's/\\.$//'"
+            res = run(cmd, shell=True, capture_output=True, text=True)
+            fqdn = res.stdout.strip() or None
+            if not fqdn:
+                status(False, "Failed to get FQDN, consider specifying it with -d")
+                sys.exit(1)
+            else:
+                status(True, f"Found FQDN: {fqdn}\nUsing Domain: {domain}")
 
         # Kerberos TGT if requested
-        if args.kerb:
-            if not which("impacket-getTGT"):
-                status(False, "impacket-getTGT not found; cannot get TGT")
-                sys.exit(1)
-            cc = get_tgt_impacket(domain, user, password, tmpdir)
-            if not cc:
-                status(False, "No .ccache found after impacket-getTGT; check output")
-                print(Path(tmpdir).joinpath("impacket_gettgt.out").read_text())
-                sys.exit(1)
-            os.environ["KRB5CCNAME"] = str(cc)
-            status(True, f"KRB5CCNAME set to {cc}")
-
-            # run BloodHound collection via nxc per your command
-            bh_out = Path(tmpdir) / "bloodhound_nxc.out"
-            run_bloodhound_nxc(domain, user, password, ip, use_kerb=True, out_file=str(bh_out))
-
-        # Try LDAP auth check via nxc (with Kerberos or creds)
-        if which("nxc"):
+        if which("nxc") and not args.kerb:
             if args.kerb:
                 r = run(["nxc", "ldap", ip, "-k"], capture_output=True, text=True)
             else:
@@ -220,20 +314,52 @@ def main():
                 status(False, "LDAP credentials rejected")
                 sys.exit(1)
             status(True, "LDAP credentials confirmed (nxc)")
-        else:
-            status(False, "nxc not installed; skipping LDAP confirm")
+        elif not which("nxc"):
+            status(False, "bro download netexec smh")
+            sys.exit(1)
 
+        if args.kerb:
+            if not which("impacket-getTGT"):
+                status(False, "impacket-getTGT not found; cannot get TGT")
+                sys.exit(1)
+            cc = get_tgt_impacket(domain, user, password, tmpdir)
+            if not cc:
+                if "kerberos sessionerror: krb_ap_err_skew(clock skew too great)" in Path(tmpdir).joinpath("impacket_gettgt.out").read_text().lower():
+                    status(False, "Yo you forgot the clock skew bud")
+                    sys.exit(1)
+                status(False, "No .ccache found after impacket-getTGT; check output") 
+                print(Path(tmpdir).joinpath("impacket_gettgt.out").read_text())
+                sys.exit(1)
+            os.environ["KRB5CCNAME"] = str(cc)
+            status(True, f"KRB5CCNAME set to {cc}")
+
+            # run BloodHound collection via nxc
+            print(f"{BLUE} => Running Bloodhound Collection...{RESET}")
+            run_bloodhound_nxc(fqdn, user, password, ip, use_kerb=True)
+        else:
+            print(f"{BLUE} => Running Bloodhound Collection...{RESET}")
+            run_bloodhound_nxc(fqdn, user, password, ip)
+        # Try LDAP auth check via nxc (with Kerberos or creds)
+        
         # SMB enumeration
-        smb_enumeration(ip, user, password)
+        if args.kerb:
+            smb_enumeration(ip, user, password, fqdn)
+        else:
+            smb_enumeration(ip, user, password)
+        
 
         # Certipy scan
+        print(f"{BLUE} => Running Certipy...{RESET}")
         cert_txt = Path(tmpdir) / f"certipy_{user}.txt"
-        json_path = run_certipy(user, password, ip, domain_upper, str(cert_txt))
+        json_path = run_certipy(user, password, ip, domain.upper(), str(cert_txt))
         if json_path:
             parse_certipy_json(json_path)
         else:
-            # parse txt fallback
-            print(cert_txt.read_text() if cert_txt.exists() else "No certipy output")
+            if "[Errno 104]" in cert_txt.read_text():
+                status(False, "Certipy connection got reset by peer (Errno 104)")
+            else:
+                status(False, "Certipy ran into an error:")
+                print(cert_txt.read_text() if cert_txt.exists() else "No certipy output")
 
         status(True, "Pwner finished successfully")
 
