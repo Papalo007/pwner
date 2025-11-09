@@ -5,7 +5,7 @@ Features:
  - a lot
 """
 #TODO: Add automatic ESC exploitation 
-#TODO: Add the --start function
+#TODO: Add mssql exploitation
 
 import argparse, os, sys, re, json, tempfile, signal, shlex, shutil
 from subprocess import run, CalledProcessError, DEVNULL, CompletedProcess
@@ -121,7 +121,7 @@ def smb_enumeration(ip, user, password, fqdn=None):
         sys.exit(1)
     print(f"{BLUE} => Enumerating SMB Shares...{RESET}")
     testing = run(
-        ["nc", "-vz", ip, "445"],
+        ["nc", "-vz", ip, "445", "-w", "1"],
         capture_output=True,   # captures both stdout and stderr
         text=True,             # returns strings, not bytes
         timeout=5
@@ -134,19 +134,25 @@ def smb_enumeration(ip, user, password, fqdn=None):
     if fqdn:
         out = run(["nxc", "smb", fqdn, "-k", "-u", user, "-p", password, "--shares"], capture_output=True, text=True)
         loggedonout = run(["nxc", "smb", fqdn, "-k", "-u", user, "-p", password, "--loggedon-users"], capture_output=True, text=True)
+        genKrb5 = run(["nxc", "smb", fqdn, "-k", "-u", user, "-p", password, "--generate-krb5-file", "krb5.conf"], capture_output=True, text=True)
     else:
         out = run(["nxc", "smb", ip, "-u", user, "-p", password, "--shares"], capture_output=True, text=True)
         loggedonout = run(["nxc", "smb", ip, "-u", user, "-p", password, "--loggedon-users"], capture_output=True, text=True)
+        genKrb5 = run(["nxc", "smb", ip, "-u", user, "-p", password, "--generate-krb5-file", "krb5.conf"], capture_output=True, text=True)
     print_clean(out.stdout)
     combined_log = (loggedonout.stdout or "") + (loggedonout.stderr or "")
     if "rpc_s_access_denied" in combined_log.lower():
-        status(False, "\nCouldn't enum logged-on users using smb")
+        status(False, "Couldn't enum logged-on users using smb")
     else:
         lines = combined_log.splitlines(keepends=True)
         result = ''.join(lines[2:])
         status(True, "\nPossibly found logged-on users:")
         print(result)
-
+    print(f"{YELLOW}[!]{RESET} Generated krb5 config. Set the environment variable:\nexport KRB5_CONFIG=krb5.conf")
+    if fqdn:
+        check_nxc_vulns(ip, user, password, fqdn)
+    else:
+        check_nxc_vulns(ip, user, password)
 
 def print_clean(text):
     # accept CompletedProcess or string
@@ -270,15 +276,138 @@ def parse_certipy_json(jsonpath):
                     desc = vuln_info.get("Description") or vuln_info.get("description") or str(vuln_info)
                     print(f"      {YELLOW}{desc}{RESET}")
 
+def check_nxc_vulns(ip, user, password, fqdn=None):
+    if fqdn:
+        out = run(["nxc", "smb", fqdn, "-k", "-u", user, "-p", password, "-M", "coerce_plus"], capture_output=True, text=True)
+    else:
+        out = run(["nxc", "smb", ip, "-u", user, "-p", password, "-M", "coerce_plus"], capture_output=True, text=True)
+    lines = out.stdout.splitlines()
+    capture = False
+    vuln_lines = []
+    for line in lines:
+        if capture:
+            vuln_lines.append(line)
+        elif "SMB" in line and f"\\{user}:" in line:
+            capture = True  # start capturing after this line
+
+    vuln_output = "\n".join(vuln_lines)
+    if vuln_output.strip():
+        status(True, "Found potential vulnerabilities:")
+        s_lines = vuln_output.splitlines()
+        skip_re = re.compile(r'Error in PrinterBug module: DCERPC Runtime Error: code: 0x16c9a0d6 - ept_s_not_registered')
+
+        out_lines = [L for L in s_lines if not skip_re.search(L)]
+        clean = "\n".join(out_lines)
+        print(f"{YELLOW}{BOLD}{clean.strip()}{RESET}")
+    else:
+        status(False, "Didn't get a hit on any coerce vulnerabilities.")
+
+
+
+def start(ip):
+    print(f"{BLUE} => Pinging {ip}...{RESET}")
+    ping_res = run(["ping","-c","1","-W","2", ip], capture_output=True, text=True)
+    if ping_res.returncode != 0:
+        status(False, f"Host {ip} unreachable")
+        sys.exit(1)
+    print(f"Sync times if you haven't already:\nfaketime \"$(ntpdate -q {ip} | cut -d ' ' -f 1,2)\" zsh\n")
+    testing = run(
+        ["nc", "-vz", ip, "445", "-w", "1"],
+        capture_output=True,  
+        text=True,             
+        timeout=5
+    )
+    out = (testing.stdout or "") + (testing.stderr or "")
+    if "open" not in out.lower():
+        status(False, "SMB doesn't seem to be open.")
+    else:
+        print(f"{BLUE} => Checking SMB")
+        smbcom = run(["nxc", "smb", ip], capture_output=True, text=True)
+        domain = detect_domain_from_nxc(ip)
+        cmd = f"dig +short ANY @{shlex.quote(ip)} {shlex.quote(domain)} | grep {shlex.quote(domain)} | head -n1 | sed 's/\\.$//'"
+        res = run(cmd, shell=True, capture_output=True, text=True)
+        fqdn = res.stdout.strip() or None
+        status(True, f"Found domain: {domain} and FQDN: {fqdn}")
+        if "NTLM:False" in smbcom.stdout:
+            print(f"{YELLOW} [!] NTLM Authentication is disabled, use Kerberos!{RESET}")
+        else:
+            smbanonym = run(["nxc", "smb", ip, "-u", "", "-p", ""], capture_output=True, text=True)
+            if "[+]" in smbanonym.stdout:
+                print(f"{GREEN}[+] Anonymous login is enabled!{RESET}")
+                enumShares = run(["nxc", "smb", ip, "-u", "", "-p", "", "--shares"], capture_output=True, text=True)
+                if "Error enumerating shares: STATUS_ACCESS_DENIED" not in enumShares.stdout:
+                    linesSh = enumShares.stdout.splitlines()
+                    rest = "\n".join(linesSh[2:])
+                    print(rest)
+                else:
+                    status(False, "Couldn't enumerate shares - Access denied")
+                enumUsers = run(["nxc", "smb", ip, "-u", "", "-p", "", "--users"], capture_output=True, text=True)
+                linesUs = enumUsers.stdout.splitlines()
+                if len(linesUs) > 2:
+                    status(True, "Potentially got a hit on users:\n")
+                    restUs = "\n".join(linesUs[2:])
+                    print(restUs)
+                else:
+                    status(False, "Couldn't enumerate users")
+                enumPassPol = run(["nxc", "smb", ip, "-u", "", "-p", "", "--pass-pol"], capture_output=True, text=True)
+                linesPP = enumPassPol.stdout.splitlines()
+                if len(linesPP) > 2:
+                    status(True, "Potentially got a hit on password policy:\n")
+                    restPP = "\n".join(linesPP[2:])
+                    print(restPP)
+                else:
+                    status(False, "Couldn't enumerate password policy")
+                out = run(["nxc", "smb", ip, "-u", "", "-p", "", "-M", "coerce_plus"], capture_output=True, text=True)
+                lines = out.stdout.splitlines()
+                capture = False
+                vuln_lines = []
+                for line in lines:
+                    if capture:
+                        vuln_lines.append(line)
+                    elif "SMB" in line and f"[+] {fqdn.split('.', 1)[1]}\\:" in line:
+                            capture = True  # start capturing after this line
+
+                vuln_output = "\n".join(vuln_lines)
+                if vuln_output.strip():
+                    status(True, "Found potential vulnerabilities:")
+                    s_lines = vuln_output.splitlines()
+                    skip_re = re.compile(r'Error in PrinterBug module: DCERPC Runtime Error: code: 0x16c9a0d6 - ept_s_not_registered')
+
+                    out_lines = [L for L in s_lines if not skip_re.search(L)]
+                    clean = "\n".join(out_lines)
+                    print(f"{YELLOW}{BOLD}{clean.strip()}{RESET}")
+                else:
+                    status(False, "Didn't get a hit on any coerce vulnerabilities.")
+                
+    # Continue after finishing SMB
+    testing = run(
+        ["nc", "-vz", ip, "1433", "-w", "1"],
+        capture_output=True,  
+        text=True,             
+        timeout=5
+    )
+    print(f"{BLUE} => Enumerating MSSQL{RESET}")
+    out = (testing.stdout or "") + (testing.stderr or "")
+    if "open" not in out.lower():
+        status(False, "MSSQL doesn't seem to be open.")
+    # TODO: add an else and start working on mssql exploitation
+    # TODO: Also add other stuff like NFS, FTP, WMI etc.
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("ip")
-    parser.add_argument("-u","--user", required=True)
-    parser.add_argument("-p","--pass", dest="passwd", required=True)
+    parser.add_argument("-u","--user")
+    parser.add_argument("-p","--pass", dest="passwd")
     parser.add_argument("-k","--kerb", action="store_true")
     parser.add_argument("-d", "--domain", help="Specify target domain FQDN (e.g. voleur.htb)")
+    parser.add_argument("--start", action="store_true")
     args = parser.parse_args()
 
+    if not args.start:
+            if not args.user or not args.passwd:
+                parser.error("{RED} [-]{RESET} You need to provide a username and pass with -u and -p when not using --start")
+    
     # tempdir auto cleaned on exit
     with tempfile.TemporaryDirectory(prefix="pwner.") as tmpdir:
         # simple signal handling: ensure cleanup
@@ -290,7 +419,11 @@ def main():
     
         ip = args.ip; user = args.user; password = args.passwd 
         
-            
+        if args.start:
+            start(ip)
+            print(f"{GREEN} ------- Pwner finished succesfully! -------{RESET}")
+            sys.exit(0)
+
         print(f"{BLUE} => Pinging {ip}...{RESET}")
         ping_res = run(["ping","-c","1","-W","2", ip], capture_output=True, text=True)
         if ping_res.returncode != 0:
@@ -321,8 +454,7 @@ def main():
             else:
                 r = run(["nxc", "ldap", ip, "-u", user, "-p", password], capture_output=True, text=True)
             o = (r.stdout or "") + (r.stderr or "")
-            print(o.strip())
-            if r.returncode != 0 or ("denied" in o.lower() or "rejected" in o.lower()):
+            if r.returncode != 0 or ("[-]" in o):
                 status(False, "LDAP credentials rejected")
                 sys.exit(1)
             status(True, "LDAP credentials confirmed (nxc)")
@@ -350,15 +482,14 @@ def main():
             run_bloodhound_nxc(fqdn, user, password, ip, use_kerb=True)
         else:
             print(f"{BLUE} => Running Bloodhound Collection...{RESET}")
-            run_bloodhound_nxc(fqdn, user, password, ip)
+            run_bloodhound_nxc(fqdn, user, password, ip, False)
         # Try LDAP auth check via nxc (with Kerberos or creds)
-        
+
         # SMB enumeration
         if args.kerb:
             smb_enumeration(ip, user, password, fqdn)
         else:
             smb_enumeration(ip, user, password)
-        
 
         # Certipy scan
         print(f"{BLUE} => Running Certipy...{RESET}")
@@ -373,7 +504,7 @@ def main():
                 status(False, "Certipy ran into an error:")
                 print(cert_txt.read_text() if cert_txt.exists() else "No certipy output")
 
-        status(True, "Pwner finished successfully")
+        print(f"{GREEN} ------- Pwner finished succesfully! -------{RESET}")
 
 if __name__ == "__main__":
     main()
