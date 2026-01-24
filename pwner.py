@@ -329,19 +329,19 @@ def start(ip):
         fqdn = res.stdout.strip() or None
         status(True, f"Found domain: {domain} and FQDN: {fqdn}")
         if "NTLM:False" in smbcom.stdout:
-            print(f"{YELLOW} [!] NTLM Authentication is disabled, use Kerberos!{RESET}")
+            print(f"{YELLOW}[!] NTLM Authentication is disabled, use Kerberos!{RESET}")
         else:
-            smbanonym = run(["nxc", "smb", ip, "-u", "", "-p", ""], capture_output=True, text=True)
+            smbanonym = run(["nxc", "smb", ip, "-u", "anonymous", "-p", ""], capture_output=True, text=True)
             if "[+]" in smbanonym.stdout:
                 print(f"{GREEN}[+] Anonymous login is enabled!{RESET}")
-                enumShares = run(["nxc", "smb", ip, "-u", "", "-p", "", "--shares"], capture_output=True, text=True)
+                enumShares = run(["nxc", "smb", ip, "-u", "anonymous", "-p", "", "--shares"], capture_output=True, text=True)
                 if "Error enumerating shares: STATUS_ACCESS_DENIED" not in enumShares.stdout:
                     linesSh = enumShares.stdout.splitlines()
                     rest = "\n".join(linesSh[2:])
                     print(rest)
                 else:
                     status(False, "Couldn't enumerate shares - Access denied")
-                enumUsers = run(["nxc", "smb", ip, "-u", "", "-p", "", "--users"], capture_output=True, text=True)
+                enumUsers = run(["nxc", "smb", ip, "-u", "anonymous", "-p", "", "--users"], capture_output=True, text=True)
                 linesUs = enumUsers.stdout.splitlines()
                 if len(linesUs) > 2:
                     status(True, "Potentially got a hit on users:\n")
@@ -349,7 +349,7 @@ def start(ip):
                     print(restUs)
                 else:
                     status(False, "Couldn't enumerate users")
-                enumPassPol = run(["nxc", "smb", ip, "-u", "", "-p", "", "--pass-pol"], capture_output=True, text=True)
+                enumPassPol = run(["nxc", "smb", ip, "-u", "anonymous", "-p", "", "--pass-pol"], capture_output=True, text=True)
                 linesPP = enumPassPol.stdout.splitlines()
                 if len(linesPP) > 2:
                     status(True, "Potentially got a hit on password policy:\n")
@@ -357,7 +357,7 @@ def start(ip):
                     print(restPP)
                 else:
                     status(False, "Couldn't enumerate password policy")
-                out = run(["nxc", "smb", ip, "-u", "", "-p", "", "-M", "coerce_plus"], capture_output=True, text=True)
+                out = run(["nxc", "smb", ip, "-u", "anonymous", "-p", "", "-M", "coerce_plus"], capture_output=True, text=True)
                 lines = out.stdout.splitlines()
                 capture = False
                 vuln_lines = []
