@@ -450,7 +450,7 @@ def main():
         # Kerberos TGT if requested
         if which("nxc") and not args.kerb:
             if args.kerb:
-                r = run(["nxc", "ldap", ip, "-k"], capture_output=True, text=True)
+                r = run(["nxc", "ldap", ip, "-u", user, "-p", password, "-k"], capture_output=True, text=True)
             else:
                 r = run(["nxc", "ldap", ip, "-u", user, "-p", password], capture_output=True, text=True)
             o = (r.stdout or "") + (r.stderr or "")
@@ -490,6 +490,30 @@ def main():
             smb_enumeration(ip, user, password, fqdn)
         else:
             smb_enumeration(ip, user, password)
+
+        # Check if you can add DNS Records
+        if args.kerb:
+            print("plcaehlder")
+        else:
+            r = run(["bloodyAD", "--host", ip, "-d", domain, "-u", user, "-p", password, "add", "dnsRecord", "test", "0.0.0.0"], capture_output=True, text=True)
+            o = (r.stdout or "") + (r.stderr or "")
+            if "[+] test has been successfully added" in o:
+                status(True, "You can add DNS records!")
+                r2 = run(["bloodyAD", "--host", ip, "-d", domain, "-u", user, "-p", password, "remove", "dnsRecord", "test", "0.0.0.0"], capture_output=True, text=True)
+                o2 = (r2.stdout or "") + (r2.stderr or "")
+                if "[-] Given record has been successfully removed from test" in o2:
+                    status(True, "Succesfully removed test DNS record")
+                else:
+                    status(False, "Failed to remove test DNS record.. You might want to check it out")
+                    print(f"bloodyAD --host {ip} -d {domain} -u {user} -p '{password}' get dnsDump")
+            elif "INSUFF_ACCESS_RIGHTS" in o:
+                status(False, "You can't add DNS records btw..")
+            elif "[Errno 113] Connect call failed" in o:
+                status(False, "Failed to connect to the target")
+            else:
+                status(False, "Got an unknown error while attempting to add a DNS record:")
+                print(o)
+
 
         # Certipy scan
         print(f"{BLUE} => Running Certipy...{RESET}")
