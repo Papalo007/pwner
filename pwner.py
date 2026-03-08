@@ -7,8 +7,10 @@ Features:
 #TODO: Add automatic ESC exploitation 
 #TODO: Add mssql exploitation
 
+#TODO: Line 267 has logic issue when user doesnt exist (aka when kerb is used)
+
 import argparse, os, sys, re, json, tempfile, signal, shlex, shutil
-from subprocess import run, CalledProcessError, DEVNULL, CompletedProcess
+from subprocess import run, CompletedProcess
 from pathlib import Path
 
 # ANSI colors
@@ -17,29 +19,6 @@ RED = '\033[0;31m'; GREEN = '\033[0;32m'; BLUE = '\033[0;34m'; YELLOW = '\033[0;
 def status(ok, msg):
     prefix = f"{GREEN}[+]{RESET}" if ok else f"{RED}[-]{RESET}"
     print(f"{prefix} {msg}")
-
-def run_cmd(cmd, desc=None, check=False):
-    if desc: print(f"{BLUE}==> {desc}{RESET}")
-    # cmd must be a list
-    r = run(cmd, capture_output=True, text=True)
-    out = (r.stdout or "") + (r.stderr or "")
-    if out:
-        print(out.strip())
-    if check and r.returncode != 0:
-        raise CalledProcessError(r.returncode, cmd, output=r.stdout, stderr=r.stderr)
-    return r
-
-def which(binname: str) -> bool:
-    """Return True if a binary is available in PATH."""
-    try:
-        # Linux / macOS way (uses built-in 'which' command)
-        run(["which", binname],
-                       stdout=DEVNULL,
-                       stderr=DEVNULL,
-                       check=True)
-        return True
-    except (CalledProcessError, FileNotFoundError):
-        return False
 
 def get_tgt_impacket(domain, user, password, tmpdir):
     domain_up = domain.upper()
@@ -63,9 +42,6 @@ def get_tgt_impacket(domain, user, password, tmpdir):
     return None
 
 def detect_domain_from_nxc(ip):
-    if not which("nxc"):
-        status(False, "NetExec is not installed bruh I'm terminating ts")
-        sys.exit(1)
     r = run(["nxc", "ldap", ip], capture_output=True, text=True)
     txt = (r.stdout or "") + (r.stderr or "")
     m = re.search(r'domain:([^\)\s]+)', txt)
@@ -78,14 +54,14 @@ def detect_domain_from_nxc(ip):
     return None
 
 def run_bloodhound_nxc(fqdn, user, password, ip, use_kerb):
-    if not which("nxc"):
-        status(False, "NetExec not installed. Cannot run BloodHound via nxc")
-        sys.exit(1)
+    print(f"{BLUE} => Running Bloodhound Collection...{RESET}")
     cmd = ["nxc", "ldap", fqdn]
     domain = fqdn.split(".", 1)[1]
     if use_kerb:
         cmd += ["-k"]
-    cmd += ["-u", user, "-p", password, "-d", domain, "--dns-server", ip, "-c", "All", "--bloodhound"]
+    else:
+        cmd += ["-u", user, "-p", password]
+    cmd += ["-d", domain, "--dns-server", ip, "-c", "All", "--bloodhound"]
     r = run(cmd, capture_output=True, text=True)
     out = (r.stdout or "") + (r.stderr or "")
 
@@ -102,7 +78,8 @@ def run_bloodhound_nxc(fqdn, user, password, ip, use_kerb):
         status(False, f"Reported zip path does not exist: {src}")
         sys.exit(1)
 
-    dest = Path(f"./{domain}_{user}_bhcol.zip")
+    
+    dest = Path(f"./{domain}_{user or 'kerb'}_bhcol.zip")
     # replace existing dest 
     try:
         if dest.exists():
@@ -116,9 +93,6 @@ def run_bloodhound_nxc(fqdn, user, password, ip, use_kerb):
     return True
 
 def smb_enumeration(ip, user, password, fqdn=None):
-    if not which("nxc"):
-        status(False, "NetExec isn't installed (how bro)")
-        sys.exit(1)
     print(f"{BLUE} => Enumerating SMB Shares...{RESET}")
     testing = run(
         ["nc", "-vz", ip, "445", "-w", "1"],
@@ -132,13 +106,13 @@ def smb_enumeration(ip, user, password, fqdn=None):
         status(False, "SMB doesn't seem to be open. Skipping..")
         return None
     if fqdn:
-        out = run(["nxc", "smb", fqdn, "-k", "-u", user, "-p", password, "--shares"], capture_output=True, text=True)
-        loggedonout = run(["nxc", "smb", fqdn, "-k", "-u", user, "-p", password, "--loggedon-users"], capture_output=True, text=True)
-        genKrb5 = run(["nxc", "smb", fqdn, "-k", "-u", user, "-p", password, "--generate-krb5-file", "krb5.conf"], capture_output=True, text=True)
+        out = run(["nxc", "smb", fqdn, "-k", "--shares"], capture_output=True, text=True)
+        loggedonout = run(["nxc", "smb", fqdn, "-k", "--loggedon-users"], capture_output=True, text=True)
+        run(["nxc", "smb", fqdn, "-k", "--generate-krb5-file", "krb5.conf"], text=True)
     else:
         out = run(["nxc", "smb", ip, "-u", user, "-p", password, "--shares"], capture_output=True, text=True)
         loggedonout = run(["nxc", "smb", ip, "-u", user, "-p", password, "--loggedon-users"], capture_output=True, text=True)
-        genKrb5 = run(["nxc", "smb", ip, "-u", user, "-p", password, "--generate-krb5-file", "krb5.conf"], capture_output=True, text=True)
+        run(["nxc", "smb", ip, "-u", user, "-p", password, "--generate-krb5-file", "krb5.conf"], text=True)
     print_clean(out.stdout)
     combined_log = (loggedonout.stdout or "") + (loggedonout.stderr or "")
     if "rpc_s_access_denied" in combined_log.lower():
@@ -148,11 +122,8 @@ def smb_enumeration(ip, user, password, fqdn=None):
         result = ''.join(lines[2:])
         status(True, "\nPossibly found logged-on users:")
         print(result)
-    print(f"{YELLOW}[!]{RESET} Generated krb5 config. Set the environment variable:\nexport KRB5_CONFIG=krb5.conf")
-    if fqdn:
-        check_nxc_vulns(ip, user, password, fqdn)
-    else:
-        check_nxc_vulns(ip, user, password)
+    print(f"{YELLOW}[!]{RESET} Generated krb5 config. Environment variable has been properly configured.")
+    os.environ["KRB5_CONFIG"] = "krb5.conf"
 
 def print_clean(text):
     # accept CompletedProcess or string
@@ -234,22 +205,28 @@ def print_clean(text):
 
         print(f"    {share_s}{' ' * pad_share}   {perms_s}{' ' * pad_perms}   {remark}")
 
-def run_certipy(user, password, ip, domain_upper, tmp_txt):
-    if not which("certipy"):
-        status(False, "bro download certipy wtf")
-        sys.exit(1)
+def run_certipy(user, password, ip, domain_upper, tmp_txt, use_kerb):
+    print(f"{BLUE} => Running Certipy...{RESET}")
     args = ["certipy", "find", "-vulnerable"]
-    # If you want -k with certipy and -target FQDN:
-    if os.environ.get("KRB5CCNAME"):
-        args += ["-k", "-u", user, "-p", password, "-dc-ip", ip, "-target", f"{domain_upper}"]
+    if use_kerb:
+        args += ["-k", "-dc-ip", ip, "-target", f"{domain_upper}"]
     else:
         args += ["-u", user, "-p", password, "-dc-ip", ip]
     r = run(args, capture_output=True, text=True)
     Path(tmp_txt).write_text((r.stdout or "") + (r.stderr or ""))
     # attempt to discover corresponding json: search cwd and /tmp
+    json_path = None
     for p in list(Path.cwd().glob("*Certipy*.json")) + list(Path("/tmp").glob("*Certipy*.json")):
-        return str(p)
-    return None
+        json_path = str(p)
+    if json_path:
+        parse_certipy_json(json_path)
+    else:
+        if "[Errno 104]" in Path(tmp_txt).read_text():
+            status(False, "Certipy connection got reset by peer (Errno 104)")
+        else:
+            status(False, "Certipy ran into an error:")
+            print(Path(tmp_txt).read_text() if Path(tmp_txt).exists() else "No certipy output")
+
 
 def parse_certipy_json(jsonpath):
     if not jsonpath:
@@ -278,7 +255,7 @@ def parse_certipy_json(jsonpath):
 
 def check_nxc_vulns(ip, user, password, fqdn=None):
     if fqdn:
-        out = run(["nxc", "smb", fqdn, "-k", "-u", user, "-p", password, "-M", "coerce_plus"], capture_output=True, text=True)
+        out = run(["nxc", "smb", fqdn, "-k", "-M", "coerce_plus"], capture_output=True, text=True)
     else:
         out = run(["nxc", "smb", ip, "-u", user, "-p", password, "-M", "coerce_plus"], capture_output=True, text=True)
     lines = out.stdout.splitlines()
@@ -301,6 +278,83 @@ def check_nxc_vulns(ip, user, password, fqdn=None):
         print(f"{YELLOW}{BOLD}{clean.strip()}{RESET}")
     else:
         status(False, "Didn't get a hit on any coerce vulnerabilities.")
+
+
+# check pre2k vulns:
+def check_pre2k(ip, user, password, fqdn, use_kerb):
+    print(f"{BLUE} => Checking Pre2K legacy computer accounts...{RESET}")
+    domain = fqdn.split(".", 1)[1] 
+    # Build bloodyAD command
+    if use_kerb:
+        cmd = ["bloodyAD", "--host", fqdn, "-d", domain, "-k",
+               "msldap", "query", "(objectClass=computer)", "--attributes", "sAMAccountName"]
+    else:
+        cmd = ["bloodyAD", "--host", ip, "-d", domain,
+               "-u", user, "-p", password,
+               "msldap", "query", "(objectClass=computer)", "--attributes", "sAMAccountName"]
+
+    r = run(cmd, capture_output=True, text=True)
+    out = (r.stdout or "") + (r.stderr or "")
+
+    # Parse all sAMAccountNames except gMSAs
+    accounts = [a for a in re.findall(r'sAMAccountName:\s*(\S+)', out) 
+            if not a.startswith("gMSA")]
+    if not accounts:
+        status(False, "Couldn't retrieve computer accounts")
+        return
+
+    status(True, f"Found {len(accounts)} computer account(s), testing pre2k passwords...")
+
+    for account in accounts:
+        username = account.rstrip("$")
+        password_attempt = username.lower()
+
+        if use_kerb:
+            test = run(["nxc", "ldap", ip, "-d", domain, "-u", account,
+                        "-p", password_attempt, "-k"],
+                       capture_output=True, text=True)
+        else:
+            test = run(["nxc", "ldap", ip, "-d", domain, "-u", account,
+                        "-p", password_attempt],
+                       capture_output=True, text=True)
+
+        nxc_out = (test.stdout or "") + (test.stderr or "")
+        if "[+]" in nxc_out:
+            status(True, f"Pre2K hit! {account} : {password_attempt}")
+
+
+def check_dns_records(ip, user, password, fqdn, use_kerb):
+
+    domain = fqdn.split(".", 1)[1]
+    cmdBase = ["bloodyAD", "--host"]
+    if use_kerb:
+        cmdBase += [fqdn, "-k"]
+    else: 
+        cmdBase += [ip, "-u", user, "-p", password]
+    cmdBase += ["-d", domain]
+
+    r = run(cmdBase + ["add", "dnsRecord", "test", "0.0.0.0"], capture_output=True, text=True)
+    o = (r.stdout or "") + (r.stderr or "")
+    if "[+] test has been successfully added" in o:
+        status(True, "You can add DNS records!")
+        r2 = run(cmdBase + ["remove", "dnsRecord", "test", "0.0.0.0"], capture_output=True, text=True)
+        o2 = (r2.stdout or "") + (r2.stderr or "")
+        if "[-] Given record has been successfully removed from test" in o2:
+            status(True, "Succesfully removed test DNS record")
+        else:
+            status(False, "Failed to remove test DNS record.. You might want to check it out")
+            if use_kerb:
+                print(f"bloodyAD --host {fqdn} -d {domain} -k get dnsDump")
+            else:
+                print(f"bloodyAD --host {ip} -d {domain} -u {user} -p '{password}' get dnsDump")
+    elif "INSUFF_ACCESS_RIGHTS" in o:
+        status(False, "You can't add DNS records btw..")
+    elif "[Errno 113] Connect call failed" in o:
+        status(False, "Failed to connect to the target")
+    else:
+        status(False, "Got an unknown error while attempting to add a DNS record:")
+        print(o)
+
 
 
 
@@ -380,6 +434,8 @@ def start(ip):
                     status(False, "Didn't get a hit on any coerce vulnerabilities.")
                 
     # Continue after finishing SMB
+    print("You might also wanna check if you can enum usernames with kerbrute:" \
+            f"~/Desktop/tools/kerbrute userenum -d {domain} /usr/share/seclists/Usernames/Names/names.txt --dc {ip}")
     testing = run(
         ["nc", "-vz", ip, "1433", "-w", "1"],
         capture_output=True,  
@@ -404,9 +460,9 @@ def main():
     parser.add_argument("--start", action="store_true")
     args = parser.parse_args()
 
-    if not args.start:
+    if not args.start and not args.kerb:
             if not args.user or not args.passwd:
-                parser.error("{RED} [-]{RESET} You need to provide a username and pass with -u and -p when not using --start")
+                parser.error(f"{RED} [-]{RESET} You need to provide a username and pass with -u and -p when not using --start")
     
     # tempdir auto cleaned on exit
     with tempfile.TemporaryDirectory(prefix="pwner.") as tmpdir:
@@ -417,7 +473,9 @@ def main():
         signal.signal(signal.SIGINT, on_sig)
         signal.signal(signal.SIGTERM, on_sig)
     
-        ip = args.ip; user = args.user; password = args.passwd 
+        ip = args.ip
+        user = args.user
+        password = args.passwd 
         
         if args.start:
             start(ip)
@@ -430,9 +488,11 @@ def main():
             status(False, f"Host {ip} unreachable")
             sys.exit(1)
 
+        # Argument checks
         regexStr = re.compile(r'^[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.[A-Za-z0-9-]+$') # Check if the domain is in the form of *.*.*
         if args.domain and not regexStr.match(args.domain):
             status(False, f"Invalid domain: {args.domain}\nProvide the FQDN e.g. dc01.voleur.htb") 
+            sys.exit(1)
         elif args.domain:
             fqdn = args.domain
             domain = fqdn.split(".", 1)[1]
@@ -447,25 +507,40 @@ def main():
             else:
                 status(True, f"Found FQDN: {fqdn}\nUsing Domain: {domain}")
 
-        # Kerberos TGT if requested
-        if which("nxc") and not args.kerb:
-            if args.kerb:
-                r = run(["nxc", "ldap", ip, "-u", user, "-p", password, "-k"], capture_output=True, text=True)
-            else:
-                r = run(["nxc", "ldap", ip, "-u", user, "-p", password], capture_output=True, text=True)
-            o = (r.stdout or "") + (r.stderr or "")
-            if r.returncode != 0 or ("[-]" in o):
-                status(False, "LDAP credentials rejected")
+
+        # Check kerberos stuff
+        if args.kerb:
+            if not os.environ.get("KRB5CCNAME") and (not user or not password):
+                status(False, "Either provide a username and password or set KRB5CCNAME to a valid ticket.")
                 sys.exit(1)
-            status(True, "LDAP credentials confirmed (nxc)")
-        elif not which("nxc"):
-            status(False, "bro download netexec smh")
+            elif not user or not password:
+                r = run(["klist"], capture_output=True, text=True)
+                o = (r.stdout or "") + (r.stderr or "")
+                if "bad format" in o.lower() or "unsupported credentials" in o.lower():
+                    status(False, f"Bad ticket file. Please set KRB5CCNAME to a valid ticket. Current ticket: {os.environ.get('KRB5CCNAME')}")
+                    sys.exit(1)
+
+
+        # Confirm creds
+        if args.kerb and user and password:
+            r = run(["nxc", "ldap", ip, "-u", user, "-p", password, "-k"], capture_output=True, text=True)
+        elif args.kerb:
+            r = run(["nxc", "ldap", ip, "-k"], capture_output=True, text=True)
+        else:
+            r = run(["nxc", "ldap", ip, "-u", user, "-p", password], capture_output=True, text=True)
+        o = (r.stdout or "") + (r.stderr or "")
+        if "[-]" in o:
+            status(False, "LDAP credentials rejected")
+            sys.exit(1)
+        elif r.returncode != 0 or ("[+]" not in o):
+            status(False, "Possibly unknown error occurred. Dumping output...")
+            print(o)
             sys.exit(1)
 
-        if args.kerb:
-            if not which("impacket-getTGT"):
-                status(False, "impacket-getTGT not found; cannot get TGT")
-                sys.exit(1)
+        status(True, "LDAP credentials confirmed (nxc)")
+        
+        # Deal with kerberos stuff
+        if args.kerb and user and password:
             cc = get_tgt_impacket(domain, user, password, tmpdir)
             if not cc:
                 if "kerberos sessionerror: krb_ap_err_skew(clock skew too great)" in Path(tmpdir).joinpath("impacket_gettgt.out").read_text().lower():
@@ -475,58 +550,33 @@ def main():
                 print(Path(tmpdir).joinpath("impacket_gettgt.out").read_text())
                 sys.exit(1)
             os.environ["KRB5CCNAME"] = str(cc)
-            status(True, f"KRB5CCNAME set to {cc}")
+            status(True, f"KRB5CCNAME set to {cc}")            
+        elif args.kerb:
+            status(True, f"Using ticket in KRB5CCNAME: {os.environ.get('KRB5CCNAME')}")
 
-            # run BloodHound collection via nxc
-            print(f"{BLUE} => Running Bloodhound Collection...{RESET}")
+
+        # Enumeration start
+        if not user:                                        # For certipy
+            cert_txt = Path(tmpdir) / "certipy_kerb.txt" 
+        else:
+            cert_txt = Path(tmpdir) / f"certipy_{user}.txt"
+        if args.kerb:
+            check_dns_records(ip, user, password, fqdn, True)
+            check_pre2k(ip, user, password, fqdn, True)
             run_bloodhound_nxc(fqdn, user, password, ip, use_kerb=True)
-        else:
-            print(f"{BLUE} => Running Bloodhound Collection...{RESET}")
-            run_bloodhound_nxc(fqdn, user, password, ip, False)
-        # Try LDAP auth check via nxc (with Kerberos or creds)
-
-        # SMB enumeration
-        if args.kerb:
             smb_enumeration(ip, user, password, fqdn)
+            check_nxc_vulns(ip, user, password, fqdn)
+            run_certipy(user, password, ip, domain.upper(), str(cert_txt), True)
+            
         else:
-            smb_enumeration(ip, user, password)
+            check_dns_records(ip, user, password, fqdn, False)
+            check_pre2k(ip, user, password, fqdn, False)
+            run_bloodhound_nxc(fqdn, user, password, ip, False)
+            smb_enumeration(ip, user, password, None)
+            check_nxc_vulns(ip, user, password)
+            run_certipy(user, password, ip, domain.upper(), str(cert_txt), False)
 
-        # Check if you can add DNS Records
-        if args.kerb:
-            print("plcaehlder")
-        else:
-            r = run(["bloodyAD", "--host", ip, "-d", domain, "-u", user, "-p", password, "add", "dnsRecord", "test", "0.0.0.0"], capture_output=True, text=True)
-            o = (r.stdout or "") + (r.stderr or "")
-            if "[+] test has been successfully added" in o:
-                status(True, "You can add DNS records!")
-                r2 = run(["bloodyAD", "--host", ip, "-d", domain, "-u", user, "-p", password, "remove", "dnsRecord", "test", "0.0.0.0"], capture_output=True, text=True)
-                o2 = (r2.stdout or "") + (r2.stderr or "")
-                if "[-] Given record has been successfully removed from test" in o2:
-                    status(True, "Succesfully removed test DNS record")
-                else:
-                    status(False, "Failed to remove test DNS record.. You might want to check it out")
-                    print(f"bloodyAD --host {ip} -d {domain} -u {user} -p '{password}' get dnsDump")
-            elif "INSUFF_ACCESS_RIGHTS" in o:
-                status(False, "You can't add DNS records btw..")
-            elif "[Errno 113] Connect call failed" in o:
-                status(False, "Failed to connect to the target")
-            else:
-                status(False, "Got an unknown error while attempting to add a DNS record:")
-                print(o)
-
-
-        # Certipy scan
-        print(f"{BLUE} => Running Certipy...{RESET}")
-        cert_txt = Path(tmpdir) / f"certipy_{user}.txt"
-        json_path = run_certipy(user, password, ip, domain.upper(), str(cert_txt))
-        if json_path:
-            parse_certipy_json(json_path)
-        else:
-            if "[Errno 104]" in cert_txt.read_text():
-                status(False, "Certipy connection got reset by peer (Errno 104)")
-            else:
-                status(False, "Certipy ran into an error:")
-                print(cert_txt.read_text() if cert_txt.exists() else "No certipy output")
+        
 
         print(f"{GREEN} ------- Pwner finished succesfully! -------{RESET}")
 
